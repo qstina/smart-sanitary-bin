@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Smart Sanitary Bin Dashboard</title>
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,700;1,400;1,700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap" rel="stylesheet">
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js"></script>
+    <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBZ_0AJTeRsy8QkDaf3Xzs99yCoPNWpdvc&libraries=marker"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link rel="stylesheet" href="styles.css">
+</head>
+
+<body class="app-bg">
+<div class="layout-container">
+    <nav class="sidebar">
+        <div class="logo-area">
+            <div class="logo-icon">🌸</div>
+            <h1 class="logo-text">Smart Sanitary Bin<br>Dashboard</h1>
+        </div>
+        <ul class="nav-links">
+            <li class="nav-item active" onclick="switchView('fleet')">
+                <i data-lucide="layout-grid"></i><span>Overview</span>
+            </li>
+            <li class="nav-item" onclick="switchView('detail')">
+                <i data-lucide="trash-2"></i><span>Monitor</span>
+            </li>
+        </ul>
+        <div class="nav-footer">
+            <p>Node ESP32_BIN_01</p>
+            <p id="syncTimeSidebar">Sync: --</p>
+        </div>
+    </nav>
+
+    <main class="main-content">
+        <header class="top-header">
+            <div>
+                <h2 id="pageTitle" class="page-title">Overview</h2>
+                <p id="liveClock" class="date-subtitle">Loading System...</p>
+            </div>
+        </header>
+
+        <section id="view-fleet" class="view-section active">
+            <div class="stats-row">
+                <div class="stat-card primary">
+                    <h3>Active Bins</h3>
+                    <p id="statActiveBins" class="big-num">0</p>
+                    <span id="statActiveLabel" class="trend up">Checking...</span>
+                </div>
+                <div class="stat-card">
+                    <h3>System Health</h3>
+                    <p id="statHealth" class="big-num">0%</p>
+                    <span id="statHealthLabel" class="trend up">Calculating...</span>
+                </div>
+                <div class="stat-card">
+                    <h3>Alerts</h3>
+                    <p id="statAlerts" class="big-num">0</p>
+                    <span id="statAlertLabel" class="trend down">All Clear</span>
+                </div>
+            </div>
+
+            <h3 class="section-heading">Live Bins</h3>
+            <div id="fleet-bento-grid" class="bento-grid">
+                <div class="bento-card main-bin" onclick="switchView('detail')">
+                    <div class="bin-header">
+                        <span id="fleet-bin-id-01" class="bin-id">ESP32_BIN_01</span>
+                        <span id="fleet-status-01" class="status-badge active">Connecting...</span>
+                    </div>
+                    <div class="bin-body">
+                        <div class="fill-indicator"><span id="fleet-fill-text-01" class="fill-simple">--%</span></div>
+                        <div class="bin-meta"><p id="fleet-location-01">Resolving location...</p></div>
+                    </div>
+                </div>
+                <div class="bento-card">
+                    <div class="bin-header">
+                        <span id="fleet-bin-id-02" class="bin-id">ESP32_BIN_02</span>
+                        <span id="fleet-status-02" class="status-badge offline">Offline</span>
+                    </div>
+                    <div class="bin-body">
+                        <div class="fill-indicator"><span id="fleet-fill-text-02" class="fill-simple">--%</span></div>
+                        <div class="bin-meta"><p id="fleet-location-02">Historical Data</p></div>
+                    </div>
+                </div>
+                <div class="bento-card">
+                    <div class="bin-header">
+                        <span id="fleet-bin-id-03" class="bin-id">ESP32_BIN_03</span>
+                        <span id="fleet-status-03" class="status-badge offline">Offline</span>
+                    </div>
+                    <div class="bin-body">
+                        <div class="fill-indicator"><span id="fleet-fill-text-03" class="fill-simple">--%</span></div>
+                        <div class="bin-meta"><p id="fleet-location-03">Historical Data</p></div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="chart-container-fleet glass-card mt-6">
+                <div class="flex justify-between items-center mb-4">
+                    <h3 class="font-bold">Fleet Average Occupancy</h3>
+                    <select id="fleetTimeFilter" onchange="loadFleetHistoricalData()" class="text-xs p-2 rounded-lg border border-emerald-800 bg-white outline-none">
+                        <option value="7">Last 7 Days</option>
+                        <option value="30" selected>Last 30 Days</option>
+                        <option value="90">Last 3 Months</option>
+                    </select>
+                </div>
+                <canvas id="fleetChart" height="100"></canvas>
+            </div>
+        </section>
+
+        <section id="view-detail" class="view-section hidden">
+            <div class="back-link" onclick="switchView('fleet')">← Back to Overview</div>
+            <div class="detail-grid">
+                <div class="left-stack flex flex-col gap-6">
+                    <div class="glass-card highlight">
+                        <p class="card-label">Capacity & Forecast</p>
+                        <div class="capacity-row">
+                            <span id="occupancy" class="capacity-value">--%</span>
+                            <span id="rawLevel" class="capacity-sub">-- cm</span>
+                        </div>
+                        <p id="etaFull" class="text-emerald-700 text-xs font-bold mt-2">🚀 Calculating ETA...</p>
+                        <div class="capacity-bar"><div id="barFill" class="capacity-fill"></div></div>
+                    </div>
+                    <div class="glass-card">
+                        <p class="card-label">Health Risk Index</p>
+                        <canvas id="riskGauge" style="max-height: 120px;"></canvas>
+                        <p id="riskLevel" class="text-center font-bold uppercase text-[10px] mt-2">Analyzing...</p>
+                    </div>
+                    <div class="glass-card">
+                        <p class="card-label">Maintenance Control</p>
+                        <button id="serviceBtn" onclick="serviceBin()" class="action-btn">🧹 Reset & Unlock Lid</button>
+                        <div class="env-grid mt-4">
+                            <div class="env-box"><span>Temp</span><strong><span id="temp">--</span>°C</strong></div>
+                            <div class="env-box"><span>Hum</span><strong><span id="hum">--</span>%</strong></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="center-stack flex flex-col gap-6">
+                    <div class="glass-card map-card h-full"><p class="card-label">📍 Live Location</p><div id="map"></div></div>
+                    <div class="glass-card">
+                        <p class="card-label">📊 Fill Velocity (ESP32_01)</p>
+                        <canvas id="disposalChart" height="120"></canvas>
+                    </div>
+                </div>
+
+                <div class="right-stack flex flex-col gap-6">
+                    <div class="bento-card main-bin">
+                        <div class="bin-header">
+                            <span id="detail-bin-id" class="bin-id">ESP32_BIN_01</span>
+                            <span id="detail-status" class="status-badge active">Connecting...</span>
+                        </div>
+                        <div class="bin-body">
+                            <div class="fill-indicator"><span id="detail-fill-text" class="fill-simple">--%</span></div>
+                            <div class="bin-meta"><p id="detail-location">Resolving location...</p></div>
+                        </div>
+                    </div>
+                    <div class="glass-card flex-grow overflow-hidden flex flex-col">
+                        <p class="card-label">Intelligence Timeline</p>
+                        <div id="eventLog" class="text-[10px] space-y-2 overflow-y-auto max-h-[350px] p-2">
+                            <p class="text-slate-500 italic">Waiting for system pulse...</p>
+                        </div>
+                    </div>
+                    <div class="glass-card">
+                        <p class="card-label">Environment Radar</p>
+                        <canvas id="envRadarChart" height="150"></canvas>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+</div>
+<script src="app.js"></script>
+<script>lucide.createIcons();</script>
+</body>
+</html>
