@@ -8,17 +8,24 @@ const db = firebase.firestore();
 const BIN_HEIGHT = 25;
 const FULL_THRESHOLD = 5;
 
+// TEST SETTING: 30 seconds for rapid testing
+const OFFLINE_THRESHOLD_MS = 30000; 
+
+// Global state to track all bins for synchronization
+let fleetState = {
+    "ESP32_BIN_01": { lastSeen: null, occupancy: 0, isFull: false, lat: null, lon: null },
+    "ESP32_BIN_02": { lastSeen: null, occupancy: 0, isFull: false, lat: null, lon: null },
+    "ESP32_BIN_03": { lastSeen: null, occupancy: 0, isFull: false, lat: null, lon: null }
+};
+
 let disposalChart, riskGauge, envRadarChart, fleetChart, map, marker;
-let chartsInitialized = false;
-let lastSeenTimestamp = null;
-let resolvedLocationText = "Resolving location...";
 
 window.onload = function() {
     updateClock();
     initCharts();
     startGlobalListeners();
-    startOfflineChecker();
-    updateFleetStats();
+    // Synchronization interval
+    setInterval(syncFleetStatusUI, 5000); 
     loadFleetHistoricalData();
 };
 
@@ -45,139 +52,160 @@ function switchView(viewName) {
 
 // --- GLOBAL LISTENERS ---
 function startGlobalListeners() {
-    // 1. Monitor real-time status for all Bins in the fleet grid
+    // 1. Real-time Status Listener
     db.collection("bin_status").onSnapshot(snapshot => {
         snapshot.forEach(doc => {
             const data = doc.data();
             const binId = doc.id;
-            const suffix = binId.split('_').pop(); // 01, 02, 03
-            const lastSeen = data.last_updated?.toDate();
-            const occupancy = data.fill_percentage || 0;
-            const isFull = data.is_full || false;
             
-            // Logic: Offline if no pulse for 2 mins
-            const isOffline = !lastSeen || (Date.now() - lastSeen.getTime()) > 120000;
-
-            const fillEl = document.getElementById(`fleet-fill-text-${suffix}`);
-            const statusEl = document.getElementById(`fleet-status-${suffix}`);
-            
-            if(fillEl) fillEl.innerText = Math.round(occupancy) + "%";
-            if(statusEl) {
-                statusEl.innerText = isOffline ? "Offline" : (isFull ? "FULL" : "Active");
-                statusEl.className = `status-badge ${isOffline ? 'offline' : (isFull ? 'full' : 'active')}`;
+            if (fleetState[binId]) {
+                // Handle Firestore Timestamp
+                fleetState[binId].lastSeen = data.last_updated ? data.last_updated.toDate() : new Date();
+                fleetState[binId].occupancy = data.fill_percentage || 0;
+                fleetState[binId].isFull = data.is_full || false;
+                fleetState[binId].lat = data.lat;
+                fleetState[binId].lon = data.lon;
+                fleetState[binId].temp = data.temp_c;
+                fleetState[binId].hum = data.humidity_pct;
             }
 
-            // Target Monitor View specifically for ESP32_BIN_01
             if(binId === "ESP32_BIN_01") {
-                lastSeenTimestamp = lastSeen;
-                updateDetailMonitor(data, lastSeen, occupancy);
+                updateDetailMonitor(data, fleetState[binId].occupancy);
                 updateLocationUI(data.lat, data.lon, "fleet-location-01");
+                
+                const syncEl = document.getElementById("syncTimeSidebar");
+                if(syncEl && fleetState[binId].lastSeen) {
+                    syncEl.innerText = "Sync: " + fleetState[binId].lastSeen.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+                }
             }
         });
+        syncFleetStatusUI();
     });
 
-    // 2. Monitor historical data for the line chart (ESP32_01 only)
-    db.collection("bin_history").where("device_id", "==", "ESP32_BIN_01").orderBy("timestamp", "desc").limit(15)
+    // 2. Historical Listener (Charts & ETA)
+    db.collection("bin_history")
+    .where("device_id", "==", "ESP32_BIN_01")
+    .orderBy("timestamp", "desc")
+    .limit(15)
     .onSnapshot(snapshot => {
         if (snapshot.empty) return;
         const docs = snapshot.docs.reverse();
         if(disposalChart) {
-            disposalChart.data.labels = docs.map(d => d.data().timestamp?.toDate().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}));
+            disposalChart.data.labels = docs.map(d => {
+                const ts = d.data().timestamp;
+                return ts ? ts.toDate().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : "";
+            });
             disposalChart.data.datasets[0].data = docs.map(d => d.data().fill_percentage);
             disposalChart.update();
         }
+        
         const latest = docs[docs.length - 1].data();
-        if(document.getElementById("rawLevel")) document.getElementById("rawLevel").innerText = latest.trash_level_cm + " cm";
+        if(document.getElementById("rawLevel")) {
+            document.getElementById("rawLevel").innerText = (latest.trash_level_cm || 0) + " cm";
+        }
         calculateETA(docs);
     });
 }
 
-// --- BAR CHART AGGREGATION & FILTERS ---
-async function loadFleetHistoricalData() {
-    const days = parseInt(document.getElementById("fleetTimeFilter").value);
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - days);
+/**
+ * MASTER SYNC: Updates the UI
+ * Formats "Last Seen" into seconds, minutes, hours, or days.
+ */
+function syncFleetStatusUI() {
+    let activeCount = 0;
+    let alertCount = 0;
+    let healthSum = 0;
+    const now = new Date();
+    const binIds = Object.keys(fleetState);
 
-    try {
-        const snapshot = await db.collection("bin_history")
-            .where("timestamp", ">=", cutoffDate)
-            .get();
-
-        const binData = { "ESP32_BIN_01": [], "ESP32_BIN_02": [], "ESP32_BIN_03": [] };
+    binIds.forEach(id => {
+        const bin = fleetState[id];
+        const suffix = id.split('_').pop();
         
-        snapshot.forEach(doc => {
-            const d = doc.data();
-            if(binData[d.device_id]) binData[d.device_id].push(d.fill_percentage);
-        });
+        // 1. Calculate Human-Readable Time Difference
+        let timeAgoText = "Never";
+        let isOffline = true;
 
-        const averages = Object.keys(binData).map(id => {
-            const vals = binData[id];
-            return vals.length ? (vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
-        });
+        if (bin.lastSeen) {
+            const diffMs = now - bin.lastSeen;
+            const diffSec = Math.floor(diffMs / 1000);
+            const diffMin = Math.floor(diffSec / 60);
+            const diffHr = Math.floor(diffMin / 60);
+            const diffDay = Math.floor(diffHr / 24);
 
-        if(fleetChart) {
-            fleetChart.data.labels = ["BIN_01", "BIN_02", "BIN_03"];
-            fleetChart.data.datasets[0].data = averages;
-            fleetChart.data.datasets[0].backgroundColor = ["#055C43", "#BDA9D1", "#64748b"];
-            fleetChart.update();
-        }
-    } catch (e) { console.error("Filter calculation error:", e); }
-}
+            isOffline = diffMs > OFFLINE_THRESHOLD_MS;
 
-// --- UPDATE STATS (ACTIVE/ALERT) ---
-function updateFleetStats() {
-    // Listen to the latest status document for every bin (01, 02, 03)
-    db.collection("bin_status").onSnapshot(snapshot => {
-        let activeCount = 0;
-        let alertCount = 0;
-        let healthSum = 0;
-        const totalBins = snapshot.size || 3; // Accounts for your 3 documented bins
-
-        snapshot.forEach(doc => {
-            const data = doc.data();
-            const lastSeen = data.last_updated?.toDate();
-            
-            // 1. Check if bin is CURRENTLY online (pulse within 2 minutes)
-            const isOffline = !lastSeen || (Date.now() - lastSeen.getTime()) > 120000;
-            
-            if (!isOffline) {
-                activeCount++;
+            if (diffSec < 60) {
+                timeAgoText = `${diffSec}s ago`;
+            } else if (diffMin < 60) {
+                timeAgoText = `${diffMin}m ago`;
+            } else if (diffHr < 24) {
+                timeAgoText = `${diffHr}h ago`;
+            } else {
+                timeAgoText = `${diffDay}d ago`;
             }
-
-            // 2. ALERT logic: Only increment if the LATEST state is 'is_full'
-            // This ignores all previous historical fill levels
-            if (data.is_full === true) {
-                alertCount++;
-            }
-
-            // Health calculation based on current connectivity
-            healthSum += isOffline ? 0 : 100;
-        });
-
-        // Push latest counts to the dashboard UI
-        const activeEl = document.getElementById("statActiveBins");
-        const alertEl = document.getElementById("statAlerts");
-        const healthEl = document.getElementById("statHealth");
-
-        if (activeEl) activeEl.innerText = activeCount;
-        if (alertEl) alertEl.innerText = alertCount;
-        
-        if (healthEl) {
-            const avgHealth = Math.round(healthSum / totalBins);
-            healthEl.innerText = avgHealth + "%";
         }
 
-        // Update visual trend labels
-        document.getElementById("statActiveLabel").innerText = 
-            activeCount === totalBins ? "All Systems Live" : "Partial Outage";
-            
-        document.getElementById("statAlertLabel").innerText = 
-            alertCount > 0 ? `${alertCount} Bins Require Emptying` : "All Clear";
+        // --- DEMO OVERRIDE: Keep BIN 02 and 03 active ---
+        if (id === "ESP32_BIN_02" || id === "ESP32_BIN_03") {
+            isOffline = false;
+        }
+
+        // 2. Update Status Badges
+        const statusEl = document.getElementById(`fleet-status-${suffix}`);
+        if (statusEl) {
+            if (isOffline) {
+                statusEl.innerText = "Offline";
+                statusEl.className = "status-badge offline";
+            } else if (bin.isFull) {
+                statusEl.innerText = "FULL";
+                statusEl.className = "status-badge full";
+            } else {
+                statusEl.innerText = "Active";
+                statusEl.className = "status-badge active";
+            }
+        }
+
+        // 3. Update Last Seen Label on Card
+        const lastSeenEl = document.getElementById(`fleet-last-seen-${suffix}`);
+        if (lastSeenEl) {
+            lastSeenEl.innerText = "Last Seen: " + timeAgoText;
+            lastSeenEl.style.color = isOffline ? "#be123c" : "#64748b"; 
+        }
+
+        // 4. Update Sidebar Sync (specifically for Bin 01)
+        if (id === "ESP32_BIN_01") {
+            const sidebarSync = document.getElementById("syncTimeSidebar");
+            if (sidebarSync) sidebarSync.innerText = "Sync: " + timeAgoText;
+        }
+
+        // 5. Update Fill Text Persistence
+        const fillEl = document.getElementById(`fleet-fill-text-${suffix}`);
+        if (fillEl) {
+            fillEl.innerText = (bin.occupancy === 0 && !bin.lastSeen) ? "--%" : Math.round(bin.occupancy) + "%";
+            fillEl.style.opacity = isOffline ? "0.6" : "1";
+        }
+
+        if (!isOffline) activeCount++;
+        if (bin.isFull) alertCount++;
+        healthSum += isOffline ? 0 : 100;
+
+        // Monitor View Status Badge
+        if (id === "ESP32_BIN_01" && document.getElementById("detail-status")) {
+            const detStatus = document.getElementById("detail-status");
+            detStatus.innerText = isOffline ? "Offline" : (bin.isFull ? "FULL" : "Active");
+            detStatus.className = `status-badge ${isOffline ? 'offline' : (bin.isFull ? 'full' : 'active')}`;
+        }
     });
+
+    // Update Top Stats Bar
+    if (document.getElementById("statActiveBins")) document.getElementById("statActiveBins").innerText = activeCount;
+    if (document.getElementById("statAlerts")) document.getElementById("statAlerts").innerText = alertCount;
+    if (document.getElementById("statHealth")) document.getElementById("statHealth").innerText = Math.round(healthSum / binIds.length) + "%";
 }
 
 // --- MONITOR UI UPDATES ---
-function updateDetailMonitor(data, lastSeen, occupancy) {
+function updateDetailMonitor(data, occupancy) {
     const rounded = Math.round(occupancy) + "%";
     if(document.getElementById("occupancy")) document.getElementById("occupancy").innerText = rounded;
     if(document.getElementById("barFill")) document.getElementById("barFill").style.width = occupancy + "%";
@@ -195,6 +223,7 @@ function updateDetailMonitor(data, lastSeen, occupancy) {
     try { updateMap(data); } catch(e) {}
 }
 
+// --- CHART INITIALIZATION ---
 function initCharts() {
     const ctx1 = document.getElementById("disposalChart");
     if(ctx1) {
@@ -235,20 +264,33 @@ function updateClock() {
     setInterval(() => {
         const now = new Date();
         const el = document.getElementById('liveClock');
-        if(el) el.innerText = now.toLocaleString('en-US', { weekday: 'long', year: 'numeric', month: 'short', day: 'numeric' });
+        if(el) el.innerText = now.toLocaleString('en-US', { weekday: 'long', year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
     }, 1000);
 }
 
-function startOfflineChecker() {
-    setInterval(() => {
-        if (!lastSeenTimestamp) return;
-        const isOffline = (Date.now() - lastSeenTimestamp.getTime()) > 120000;
-        const fleetStatus = document.getElementById("fleet-status-01");
-        if(isOffline && fleetStatus) {
-            fleetStatus.innerText = "Offline";
-            fleetStatus.className = "status-badge offline";
+async function loadFleetHistoricalData() {
+    const days = parseInt(document.getElementById("fleetTimeFilter").value);
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - days);
+
+    try {
+        const snapshot = await db.collection("bin_history").where("timestamp", ">=", cutoffDate).get();
+        const binData = { "ESP32_BIN_01": [], "ESP32_BIN_02": [], "ESP32_BIN_03": [] };
+        snapshot.forEach(doc => {
+            const d = doc.data();
+            if(binData[d.device_id]) binData[d.device_id].push(d.fill_percentage);
+        });
+        const averages = Object.keys(binData).map(id => {
+            const vals = binData[id];
+            return vals.length ? (vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
+        });
+        if(fleetChart) {
+            fleetChart.data.labels = ["BIN_01", "BIN_02", "BIN_03"];
+            fleetChart.data.datasets[0].data = averages;
+            fleetChart.data.datasets[0].backgroundColor = ["#055C43", "#BDA9D1", "#64748b"];
+            fleetChart.update();
         }
-    }, 5000);
+    } catch (e) { console.error("Filter error:", e); }
 }
 
 async function updateLocationUI(lat, lon, id) {
@@ -258,10 +300,10 @@ async function updateLocationUI(lat, lon, id) {
         if (status === "OK" && results[0]) {
             const loc = results[0].formatted_address.split(",").slice(0, 2).join(", ");
             const el = document.getElementById(id);
-            if(el) el.innerText = loc + " · Live Data";
+            if(el) el.innerText = loc + " · Live";
             if(id === "fleet-location-01") {
                 const det = document.getElementById("detail-location");
-                if(det) det.innerText = loc + " · Live Data";
+                if(det) det.innerText = loc + " · Live";
             }
         }
     });
@@ -280,15 +322,23 @@ function updateRiskUI(index) {
 function calculateETA(docs) {
     const el = document.getElementById("etaFull");
     if(!el || docs.length < 5) return;
+    
     const first = docs[0].data();
     const last = docs[docs.length - 1].data();
+    
+    if (!first.timestamp || !last.timestamp) return;
+
     const timeDiff = (last.timestamp.seconds - first.timestamp.seconds) / 60; 
-    const fillDiff = ((BIN_HEIGHT - last.trash_level_cm) - (BIN_HEIGHT - first.trash_level_cm));
-    if (fillDiff > 0) {
+    const fillDiff = (first.trash_level_cm - last.trash_level_cm); 
+
+    if (fillDiff > 0 && timeDiff > 0) {
         const rate = fillDiff / timeDiff;
         const remaining = last.trash_level_cm - FULL_THRESHOLD;
-        el.innerText = `Full in ~${Math.abs(Math.round(remaining / rate))} mins`;
-    } else { el.innerText = "Usage Stable"; }
+        const minutes = Math.abs(Math.round(remaining / rate));
+        el.innerText = `Full in ~${minutes} mins`;
+    } else { 
+        el.innerText = "Usage Stable"; 
+    }
 }
 
 async function serviceBin() {

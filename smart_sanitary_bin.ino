@@ -13,7 +13,7 @@ const char* cloudBridgeUrl = "https://process-bin-data-238356769828.us-central1.
 const char* googleApiKey = "AIzaSyBZ_0AJTeRsy8QkDaf3Xzs99yCoPNWpdvc";
 
 // Constraints
-const int BIN_HEIGHT = 26.2;
+const int BIN_HEIGHT = 26;
 const int FULL_THRESHOLD = 6;
 
 // Pins
@@ -34,37 +34,24 @@ Servo binServo;
 // --- Global Variables ---
 float binLat = 0.0, binLon = 0.0;
 unsigned long lastCloudUpdate = 0;
-unsigned long lastCommandCheck = 0;
-bool systemReady = false;
-bool fullNotified = false;
-
-// --- Lock Logic ---
+unsigned long lastHeartbeat = 0;
 bool binLocked = false;
-unsigned long lastUnlockTime = 0;
-const unsigned long GRACE_PERIOD = 15000;
-
-// --- Remote Unlock State Machine ---
 bool unlockRequested = false;
 bool unlocking = false;
 unsigned long unlockStart = 0;
 const unsigned long UNLOCK_DURATION = 5000;
-
-// --- Timing ---
-unsigned long commandInterval = 5000;
-
-// --- Function Prototypes ---
-void readAndUploadSensors(const char* reason);
-void getWiFiTriangulation();
-long readDistance(int trig, int echo);
-void checkWebCommands();
-void updateLEDs(int percentage);
-void syncTimeBypassNTP();
+const unsigned long HEARTBEAT_INTERVAL = 45000; // Keep dashboard active
 
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  pinMode(LID_TRIG, OUTPUT); pinMode(LID_ECHO, INPUT);
+  pinMode(LEVEL_TRIG, OUTPUT); pinMode(LEVEL_ECHO, INPUT);
+  pinMode(LED_GREEN, OUTPUT); pinMode(LED_YELLOW, OUTPUT); pinMode(LED_RED, OUTPUT);
+
+  // WiFi connection with detailed prints
   WiFi.begin(ssid, password);
   Serial.print("Connecting to Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -72,28 +59,20 @@ void setup() {
     Serial.print(".");
   }
   Serial.println("\n✓ CONNECTED!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
 
   syncTimeBypassNTP();
-
-  pinMode(LID_TRIG, OUTPUT); pinMode(LID_ECHO, INPUT);
-  pinMode(LEVEL_TRIG, OUTPUT); pinMode(LEVEL_ECHO, INPUT);
-  pinMode(LED_GREEN, OUTPUT);
-  pinMode(LED_YELLOW, OUTPUT);
-  pinMode(LED_RED, OUTPUT);
-
   dht.begin();
-  ESP32PWM::allocateTimer(0);
-  binServo.setPeriodHertz(50);
   binServo.attach(SERVO_PIN, 500, 2400);
   binServo.write(0);
 
   Serial.println("Getting location...");
   getWiFiTriangulation();
+  Serial.printf("Location Fixed: %.6f, %.6f\n", binLat, binLon);
 
   Serial.println("Establishing handshake...");
   readAndUploadSensors("System boot / handshake");
-
-  systemReady = true;
   Serial.println("\n=== SYSTEM READY ===\n");
 }
 
@@ -101,21 +80,22 @@ void setup() {
 void loop() {
   long lidDist = readDistance(LID_TRIG, LID_ECHO);
 
-  // ---- Cloud command check (ONLY when bin is locked / full) ----
-  if (binLocked) {
-    commandInterval = 3000;
-    if (millis() - lastCommandCheck >= commandInterval) {
-      Serial.println("☁ Bin FULL → checking cloud commands...");
-      checkWebCommands();
-      lastCommandCheck = millis();
-    }
-  } else {
-    lastCommandCheck = millis();
+  // Check for remote unlock commands from the dashboard
+  if (binLocked && (millis() % 5000 < 200)) {
+    Serial.println("☁ Bin FULL -> checking cloud commands...");
+    checkWebCommands();
   }
 
-  // ---- Remote unlock handling ----
+  // Periodic heartbeat to prevent dashboard "Offline" status
+  if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+    Serial.println("💓 Sending heartbeat to stay active...");
+    readAndUploadSensors("Heartbeat");
+    lastHeartbeat = millis();
+  }
+
+  // Handle Remote Unlock State
   if (unlockRequested && !unlocking) {
-    Serial.println("🔓 Remote unlock: opening lid");
+    Serial.println("🔓 REMOTE UNLOCK RECEIVED: Opening lid");
     binServo.write(120);
     unlockStart = millis();
     unlocking = true;
@@ -125,194 +105,199 @@ void loop() {
   if (unlocking && millis() - unlockStart >= UNLOCK_DURATION) {
     binServo.write(0);
     delay(2000);
-    Serial.println("🔒 Remote unlock finished, lid is closed.");
+    Serial.println("🔒 Remote unlock duration finished.");
     unlocking = false;
     readAndUploadSensors("Remote unlock completed");
   }
 
-  // ---- Proximity-based lid control ----
+  // Proximity Lid Control
   if (!unlocking && lidDist > 1 && lidDist < 15) {
-    Serial.println("🚶 Object detected near bin");
     if (binLocked) {
-      Serial.println("❌ Bin locked (FULL)");
-      digitalWrite(LED_RED, LOW);
-      delay(100);
-      digitalWrite(LED_RED, HIGH);
+      Serial.println("❌ Bin locked (FULL). Denying access.");
+      for(int i=0; i<3; i++) {
+        digitalWrite(LED_RED, HIGH); delay(100); digitalWrite(LED_RED, LOW); delay(100);
+      }
     } else {
-      Serial.println("✅ Opening lid");
+      Serial.println("🚶 Object detected: Opening lid");
       binServo.write(120);
       delay(3000);
       binServo.write(0);
       delay(2000);
-      Serial.println("🔒 Lid closed");
+      Serial.println("🔒 Lid cycle complete.");
       readAndUploadSensors("Proximity lid open");
     }
   }
-
-  // OPTIONAL: Add this inside your loop() if you want the bin to stay "Active" when idle
-  if (millis() - lastCloudUpdate >= 60000) { // Every 60 seconds
-      readAndUploadSensors("Periodic Heartbeat");
-  }
-
-  delay(200); // 0.2s
+  delay(200);
 }
 
-// ================= SENSOR UPLOAD =================
+// ================= CLOUD FUNCTIONS =================
 void readAndUploadSensors(const char* reason) {
   Serial.println("\n📡 SENSOR UPDATE START");
   Serial.printf("Reason: %s\n", reason);
 
   float h = dht.readHumidity();
   float t = dht.readTemperature();
-  long trashLevel = readDistance(LEVEL_TRIG, LEVEL_ECHO);
+  long dist = readDistance(LEVEL_TRIG, LEVEL_ECHO);
+  int fill = constrain(map(dist, BIN_HEIGHT, FULL_THRESHOLD, 0, 100), 0, 100);
 
-  int fillPerc = map(trashLevel, BIN_HEIGHT, FULL_THRESHOLD, 0, 100);
-  fillPerc = constrain(fillPerc, 0, 100);
+  Serial.printf("🗑 Trash level: %ld cm (%d%%)\n", dist, fill);
+  Serial.printf("🌡 Temperature: %.1f °C | 💧 Humidity: %.1f %%\n", t, h);
 
-  Serial.printf("🗑 Trash level: %ld cm (%d%%)\n", trashLevel, fillPerc);
-  Serial.printf("🌡 Temperature: %.1f °C\n", t);
-  Serial.printf("💧 Humidity: %.1f %%\n", h);
-
-  // --- Compose JSON with fill_percentage ---
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<512> doc;
   doc["device_id"] = "ESP32_BIN_01";
-  doc["trash_level_cm"] = trashLevel;
+  doc["trash_level_cm"] = dist;
   doc["temp_c"] = t;
   doc["humidity_pct"] = h;
+  doc["fill_percentage"] = fill;
   doc["lat"] = binLat;
   doc["lon"] = binLon;
-  doc["fill_percentage"] = fillPerc;   // <--- important
 
-  // --- Upload to Cloud ---
   String body;
   serializeJson(doc, body);
-  HTTPClient http;
+  Serial.println("Sending JSON to Cloud:");
+  Serial.println(body);
+
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setInsecure(); // Required for Cloud Run HTTPS
+  HTTPClient http;
+  
   if (http.begin(client, cloudBridgeUrl)) {
-      http.addHeader("Content-Type", "application/json");
-      int code = http.POST(body);
-      Serial.printf("☁ Cloud response: %d\n", code);
-      http.end();
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(body);
+    Serial.printf("☁ Cloud response: HTTP %d\n", code);
+    
+    if(code == 200) {
+      Serial.println("✓ Data uploaded successfully");
+    } else {
+      Serial.printf("✗ Upload failed. Server Response: %s\n", http.getString().c_str());
+    }
+    http.end();
+  } else {
+    Serial.println("✗ Connection to cloud bridge failed.");
   }
 
-  // Lock logic
-  bool inGrace = (millis() - lastUnlockTime < GRACE_PERIOD);
-  binLocked = (fillPerc >= 95 && !inGrace);
-  Serial.printf("🔒 Bin locked: %s\n", binLocked ? "YES" : "NO");
-  updateLEDs(fillPerc);
-
-  // Notify cloud ONLY ONCE when bin becomes full
-  if (binLocked && !fullNotified) {
-    Serial.println("🚨 Bin just became FULL → notifying workers");
-    fullNotified = true;
-  } 
-
-  // Reset flag when bin is no longer full
-  if (!binLocked) fullNotified = false;
-
-  lastCloudUpdate = millis();
+  binLocked = (fill >= 95);
+  Serial.printf("🔒 Bin locked status: %s\n", binLocked ? "YES" : "NO");
+  updateLEDs(fill);
   Serial.println("📡 SENSOR UPDATE END\n");
 }
 
-// ================= CHECK CLOUD COMMANDS =================
 void checkWebCommands() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  StaticJsonDocument<128> doc;
+  doc["device_id"] = "ESP32_BIN_01";
+  doc["command_check"] = true;
+  String body;
+  serializeJson(doc, body);
 
-  digitalWrite(LED_YELLOW, HIGH);
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-
+  
   if (http.begin(client, cloudBridgeUrl)) {
     http.addHeader("Content-Type", "application/json");
-    StaticJsonDocument<128> doc;
-    doc["device_id"] = "ESP32_BIN_01";
-    doc["command_check"] = true;
-
-    String body;
-    serializeJson(doc, body);
     int code = http.POST(body);
-    Serial.printf("Checking cloud commands, HTTP code: %d\n", code);
 
     if (code == 200) {
-      String payload = http.getString();
-      Serial.printf("Payload: %s\n", payload.c_str());
-      if (payload.indexOf("RESET") >= 0) {
-        Serial.println("🔓 REMOTE UNLOCK RECEIVED");
+      String res = http.getString();
+      res.trim();
+      Serial.printf("Command Received: [%s]\n", res.c_str());
+      if (res.indexOf("RESET") >= 0) {
         unlockRequested = true;
-        lastUnlockTime = millis();
         binLocked = false;
       }
     }
     http.end();
   }
-  digitalWrite(LED_YELLOW, LOW);
 }
 
-// ================= LED UPDATE =================
+// ================= UTILITIES =================
 void updateLEDs(int p) {
   digitalWrite(LED_GREEN, p <= 50);
-  digitalWrite(LED_YELLOW, p > 50 && p < 95); // yellow stops at 94%
-  digitalWrite(LED_RED, p >= 95);             // red shows 95%+
+  digitalWrite(LED_YELLOW, p > 50 && p < 95);
+  digitalWrite(LED_RED, p >= 95);
 }
 
-// ================= WIFI TRIANGULATION =================
+long readDistance(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long dur = pulseIn(echo, HIGH, 25000);
+  return dur == 0 ? 100 : dur * 0.034 / 2;
+}
+
+void syncTimeBypassNTP() {
+  Serial.println("Syncing time from Google...");
+  HTTPClient http;
+  if (http.begin("http://www.google.com")) {
+    const char* keys[] = {"Date"};
+    http.collectHeaders(keys, 1);
+    if (http.GET() > 0) {
+      String date = http.header("Date");
+      Serial.println("Date Header: " + date);
+      struct tm tm;
+      if (strptime(date.c_str(), "%a, %d %b %Y %H:%M:%S", &tm)) {
+        time_t t = mktime(&tm);
+        struct timeval tv = {.tv_sec = t};
+        settimeofday(&tv, NULL);
+        Serial.println("✓ Time synced.");
+      }
+    }
+    http.end();
+  }
+}
+
 void getWiFiTriangulation() {
+  Serial.println("Scanning WiFi for Geolocation...");
   int n = WiFi.scanNetworks();
-  if (n == 0) return;
-
-  StaticJsonDocument<1024> doc;
-  doc["considerIp"] = true;
+  if (n == 0) {
+    Serial.println("No networks found. Skipping.");
+    return;
+  }
+  
+  // Use a smaller document size to save RAM
+  StaticJsonDocument<768> doc;
+  doc["considerIp"] = "true";
   JsonArray arr = doc.createNestedArray("wifiAccessPoints");
-
-  for (int i = 0; i < min(n, 5); i++) {
+  
+  // Limit to 3 strongest networks to save memory
+  for (int i = 0; i < min(n, 3); i++) {
     JsonObject w = arr.createNestedObject();
     w["macAddress"] = WiFi.BSSIDstr(i);
     w["signalStrength"] = WiFi.RSSI(i);
   }
 
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setInsecure(); // Required to bypass certificate validation
+
   HTTPClient http;
   String url = "https://www.googleapis.com/geolocation/v1/geolocate?key=" + String(googleApiKey);
 
+  http.setTimeout(10000); 
+
+  Serial.println("Connecting to Google Geolocation API...");
   if (http.begin(client, url)) {
+    http.addHeader("Content-Type", "application/json");
+
     String body;
     serializeJson(doc, body);
-    if (http.POST(body) == 200) {
+    int code = http.POST(body);
+    
+    Serial.printf("Geolocation API HTTP Code: %d\n", code);
+
+    if (code == 200) {
+      String response = http.getString();
       StaticJsonDocument<256> r;
-      deserializeJson(r, http.getString());
+      deserializeJson(r, response);
       binLat = r["location"]["lat"];
       binLon = r["location"]["lng"];
+      Serial.printf("✓ Location Fixed: %.6f, %.6f\n", binLat, binLon);
+    } else {
+      Serial.print("✗ Geolocation Failed. Error: ");
+      Serial.println(http.errorToString(code).c_str());
+      if (code > 0) Serial.println("Response: " + http.getString());
     }
     http.end();
+  } else {
+    Serial.println("✗ Unable to create connection to Google.");
   }
-}
-
-// ================= TIME SYNC =================
-void syncTimeBypassNTP() {
-  HTTPClient http;
-  if (http.begin("http://www.google.com")) {
-    const char* keys[] = {"Date"};
-    http.collectHeaders(keys, 1);
-    if (http.GET() > 0) {
-      struct tm tm;
-      if (strptime(http.header("Date").c_str(), "%a, %d %b %Y %H:%M:%S", &tm)) {
-        time_t t = mktime(&tm);
-        struct timeval tv = {.tv_sec = t};
-        settimeofday(&tv, NULL);
-      }
-    }
-    http.end();
-  }
-}
-
-// ================= ULTRASONIC SENSOR =================
-long readDistance(int trig, int echo) {
-  digitalWrite(trig, LOW); delayMicroseconds(2);
-  digitalWrite(trig, HIGH); delayMicroseconds(10);
-  digitalWrite(trig, LOW);
-  long d = pulseIn(echo, HIGH, 25000);
-  return d == 0 ? 100 : d * 0.034 / 2;
 }
