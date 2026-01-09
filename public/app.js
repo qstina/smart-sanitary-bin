@@ -146,11 +146,6 @@ function syncFleetStatusUI() {
             }
         }
 
-        // --- DEMO OVERRIDE: Keep BIN 02 and 03 active ---
-        if (id === "ESP32_BIN_02" || id === "ESP32_BIN_03") {
-            isOffline = false;
-        }
-
         // 2. Update Status Badges
         const statusEl = document.getElementById(`fleet-status-${suffix}`);
         if (statusEl) {
