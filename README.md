@@ -2,6 +2,9 @@
 
 A cloud-native IoT ecosystem designed to support **Smart City (SDG 11)** initiatives through real-time waste monitoring, environmental risk assessment, and serverless data processing.
 
+<img width="1000" height="707" alt="1" src="https://github.com/user-attachments/assets/49532d4f-c93c-48bb-963a-0293a8da5532" /> 
+<img width="1000" height="590" alt="2" src="https://github.com/user-attachments/assets/8772cf4e-3653-4796-89f8-0a65bf4220ae" />
+
 ---
 
 ## 📌 Project Overview
